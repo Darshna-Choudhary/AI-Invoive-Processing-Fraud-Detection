@@ -1,0 +1,56 @@
+{
+    "vendor_name": "McLean-Cochran",
+    "vendor_address": "4894 Melanie Pass Apt. 742 Tammyland, SD 42587 US",
+    "vendor_tax_id": null,
+    "invoice_number": "INV/43-51/346",
+    "invoice_date": "2007-07-26",
+    "due_date": "1998-05-29",
+    "po_number": null,
+    "bill_to_name": "Richard Combs",
+    "currency": "USD",
+    "subtotal": 689.55,
+    "tax_total": 0.0,
+    "discount_total": 15.38,
+    "shipping_total": null,
+    "total_amount": 705.26,
+    "payment_terms": "Please send payment within 8 days of receiving this invoice. There will be a 2.5% interest charge per month on late invoices. Please include the invoice number in your payment notes.",
+    "line_items": [
+        {
+            "description": "Magazine pull state.",
+            "quantity": 1.0,
+            "unit_price": 14.39,
+            "tax": 0.0,
+            "amount": 14.39
+        },
+        {
+            "description": "Stop expert true.",
+            "quantity": 1.0,
+            "unit_price": 52.11,
+            "tax": 0.0,
+            "amount": 52.11
+        },
+        {
+            "description": "Chance toward.",
+            "quantity": 2.0,
+            "unit_price": 86.69,
+            "tax": 0.0,
+            "amount": 173.38
+        },
+        {
+            "description": "Than all serve.",
+            "quantity": 3.0,
+            "unit_price": 84.01,
+            "tax": 0.0,
+            "amount": 252.03
+        },
+        {
+            "description": "Budget this.",
+            "quantity": 2.0,
+            "unit_price": 98.82,
+            "tax": 0.0,
+            "amount": 197.64
+        }
+    ],
+    "confidence": "high",
+    "extraction_notes": "All fields are clearly legible. Dates converted to YYYY-MM-DD format. Vendor tax ID not present. Subtotal calculated as sum of line item amounts before discount and tax."
+}
