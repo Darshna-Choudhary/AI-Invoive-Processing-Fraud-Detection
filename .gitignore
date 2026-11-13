@@ -8,4 +8,12 @@ venv/
 .DS_Store
 *.log
 data/
-resultant_data/
+/uploads/*
+!/uploads/.gitkeep
+/outputs/*
+!/outputs/.gitkeep
+credentials/
+outputs/
+uploads/
+excel_export.py
+__init__.py
