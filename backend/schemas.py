@@ -1,16 +1,11 @@
-"""Shared request and response types for invoice processing."""
-
 from pathlib import Path
 from typing import Any, TypedDict
 
-
 ALLOWED_EXTENSIONS = frozenset({".pdf", ".jpg", ".jpeg", ".png", ".webp"})
-
 
 class ApiError(TypedDict):
     filename: str
     error: str
-
 
 class BatchResponse(TypedDict, total=False):
     batch_id: str
