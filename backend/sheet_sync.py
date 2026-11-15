@@ -1,7 +1,6 @@
-
 import os
 import gspread
-
+from datetime import datetime, date
 from dotenv import load_dotenv
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -314,6 +313,33 @@ def write_rows_at_next_position(worksheet, rows):
     )
 
 
+def normalize_date(value):
+    if not value:
+        return ""
+
+    if isinstance(value, (datetime, date)):
+        return value.strftime("%Y-%m-%d")
+
+    value = str(value).strip()
+
+    formats = [
+        "%Y-%m-%d",
+        "%d-%b-%Y",
+        "%d-%B-%Y",
+        "%d/%m/%Y",
+        "%m/%d/%Y",
+        "%d-%m-%Y",
+        "%Y/%m/%d",
+    ]
+
+    for fmt in formats:
+        try:
+            return datetime.strptime(value, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+
+    return value
+
 # --------------------------------------------------
 # GOOGLE SHEETS SYNCHRONIZATION
 # --------------------------------------------------
@@ -385,8 +411,8 @@ def sync_batch_to_google_sheets(results, batch_id):
 
         vendor_tax_id = data.get("gstin") or ""
         invoice_no = data.get("invoice_number") or ""
-        invoice_date = data.get("invoice_date") or ""
-        due_date = data.get("due_date") or ""
+        invoice_date = normalize_date(data.get("invoice_date"))
+        due_date = normalize_date(data.get("due_date"))
         po_number = data.get("po_number") or ""
 
         currency = data.get("currency") or ""
@@ -395,6 +421,20 @@ def sync_batch_to_google_sheets(results, batch_id):
         discount = data.get("discount")
         shipping = data.get("shipping")
         total = data.get("total_amount")
+        if total is None:
+            calculated_total = data.get("validation", {}).get("calculated_total")
+        if calculated_total is not None:
+            total = calculated_total
+        elif data.get("subtotal") is not None:
+            subtotal_value = float(data["subtotal"])
+            discount_value = float(data.get("discount") or 0)
+            tax_value = float(data.get("tax_amount") or 0)
+            shipping_value = float(data.get("shipping") or 0)
+            total = round(
+            subtotal_value - discount_value
+            + tax_value + shipping_value,
+            2
+        )
 
         payment_terms = data.get("payment_terms") or ""
         confidence = data.get("confidence") or ""

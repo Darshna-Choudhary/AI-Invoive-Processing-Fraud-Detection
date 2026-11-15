@@ -4,6 +4,7 @@ import uuid
 import threading
 import queue
 import traceback
+import asyncio
 from dotenv import load_dotenv
 
 # ---------------------------------
@@ -58,7 +59,6 @@ DEFAULT_STATE = {
 }
 
 for key, value in DEFAULT_STATE.items():
-
     if key not in st.session_state:
         st.session_state[key] = value
 
@@ -68,22 +68,8 @@ for key, value in DEFAULT_STATE.items():
 # =================================
 
 def run_batch(files, event_queue):
-
     try:
-
-        def update_progress(result, completed, total):
-
-            event_queue.put({
-                "type": "progress",
-                "result": result,
-                "completed": completed,
-                "total": total
-            })
-
-        report = process_batch(
-            files,
-            progress_callback=update_progress
-        )
+        report = asyncio.run(process_batch(files))
 
         event_queue.put({
             "type": "completed",
@@ -91,7 +77,6 @@ def run_batch(files, event_queue):
         })
 
     except Exception as error:
-
         event_queue.put({
             "type": "error",
             "message": str(error),
@@ -120,15 +105,12 @@ uploaded_files = st.file_uploader(
 )
 
 if uploaded_files:
-
     st.success(
         f"{len(uploaded_files)} invoices selected"
     )
 
     st.write("### Selected files")
-
     for index, file in enumerate(uploaded_files):
-
         st.write(
             f"📄 {file.name} — {file.size / 1024:.1f} KB"
         )

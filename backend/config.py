@@ -1,14 +1,8 @@
 import os
+from dotenv import load_dotenv
 
-# Set these before importing Paddle/PaddleOCR.
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["NUMEXPR_NUM_THREADS"] = "1"
-
-BASE_DIR = os.path.dirname(
-    os.path.dirname(os.path.abspath(__file__))
-)
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
 OUTPUT_DIR = os.path.join(BASE_DIR, "outputs")
@@ -16,13 +10,11 @@ OUTPUT_DIR = os.path.join(BASE_DIR, "outputs")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Initial configuration: benchmark before increasing.
-OCR_WORKERS = 3
-OCR_CPU_THREADS = 1
-
-PDF_DPI = 180
-MAX_PDF_PAGES = 100
+# Gemini API configuration
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_CONCURRENCY = int(os.getenv("GEMINI_CONCURRENCY", "3"))
+GEMINI_MAX_RETRIES = int(os.getenv("GEMINI_MAX_RETRIES", "3"))
 
 ALLOWED_EXTENSIONS = {
-    ".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff"
+    ".pdf", ".png", ".jpg", ".jpeg", ".webp"
 }
