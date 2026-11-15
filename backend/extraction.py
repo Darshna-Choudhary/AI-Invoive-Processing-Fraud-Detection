@@ -8,10 +8,15 @@ from decimal import Decimal, InvalidOperation
 def normalize_text(text):
     text = (text or "").replace("\u00a0", " ")
     text = text.replace("–", "-").replace("—", "-")
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\s*:\s*", ": ", text)
-    text = re.sub(r"(?<=\$)\s+", "", text)
-    return text.strip()
+
+    # Normalize spaces without destroying line boundaries.
+    lines = []
+    for line in text.splitlines():
+        line = re.sub(r"[ \t]+", " ", line)
+        line = re.sub(r"\s*:\s*", ": ", line)
+        lines.append(line.strip())
+
+    return "\n".join(line for line in lines if line)
 
 
 def parse_amount(value):
@@ -68,9 +73,8 @@ def find_first(patterns, text):
 # FINANCIAL EXTRACTION
 # --------------------------------------------------
 
-def find_amount(labels, text):
-    currency = r"(?:INR|USD|EUR|GBP|Rs\.?|₹|\$|€|£)"
 
+def find_amount(labels, text):
     for line in text.splitlines():
         line = line.strip()
 
@@ -79,13 +83,17 @@ def find_amount(labels, text):
                 rf"^\s*(?:{label})"
                 rf"\s*(?:\([^)]*\))?"
                 rf"\s*[:=]?\s*"
-                rf"(?:\(\s*[-+]?\s*\)\s*)?"
-                rf"(?:{currency}\s*)?"
+                rf"(?:\(\s*[-+]\s*\)\s*)?"
+                rf"(?:INR|USD|EUR|GBP|Rs\.?|₹|\$|€|£)?\s*"
                 rf"(-?[\d,]+(?:\.\d{{1,2}})?)"
-                rf"\s*(?:{currency})?\s*$"
+                rf"\s*(?:INR|USD|EUR|GBP|Rs\.?|₹|\$|€|£)?\s*$"
             )
 
-            match = re.search(pattern, line, re.IGNORECASE)
+            match = re.search(
+                pattern,
+                line,
+                re.IGNORECASE
+            )
 
             if match:
                 return parse_amount(match.group(1))
@@ -273,32 +281,61 @@ def parse_address_line(value):
     return result
 
 
+
 def extract_contact_fields(text):
-    email = re.findall(
+    # Remove email addresses before detecting websites or phone numbers.
+    clean_text = re.sub(
+        r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
+        " ",
+        text,
+        flags=re.I
+    )
+
+    # Explicit website detection: www, Website, Site or URL.
+    website = None
+
+    website_match = re.search(
+        r"(?:www\.|(?:website|site|url)\s*:\s*)"
+        r"(?:https?://)?"
+        r"([A-Z0-9.-]+\.(?:com|org|net|biz|in|co))",
+        clean_text,
+        re.I
+    )
+
+    if website_match:
+        website = website_match.group(1).lower()
+
+    # Only accept phone numbers associated with a phone label.
+    # This prevents GSTIN, bank account and other numeric IDs
+    # from being interpreted as phone numbers.
+    phone = None
+
+    phone_match = re.search(
+        r"\b(?:Tel|Telephone|Phone|Mobile)\s*:\s*"
+        r"(\+?[\d][\d\s().-]{6,20})",
+        clean_text,
+        re.I
+    )
+
+    if phone_match:
+        candidate = phone_match.group(1).strip()
+
+        digits = re.sub(r"\D", "", candidate)
+
+        if 7 <= len(digits) <= 15:
+            phone = candidate
+
+    emails = re.findall(
         r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
         text,
-        re.IGNORECASE
-    )
-
-    website = re.findall(
-        r"(?:https?://)?(?:www\.)?[A-Z0-9.-]+\."
-        r"(?:com|org|net|biz|in|co)\b",
-        text,
-        re.IGNORECASE
-    )
-
-    phone = re.findall(
-        r"(?:\+?\(?\d{1,4}\)?[\s.-]*)?"
-        r"\d{2,4}[\s.-]*\d{3,5}[\s.-]*\d{3,5}",
-        text
+        re.I
     )
 
     return {
-        "emails": list(dict.fromkeys(email)),
-        "website": website[0] if website else None,
-        "phone": phone[0] if phone else None
+        "emails": list(dict.fromkeys(emails)),
+        "website": website,
+        "phone": phone
     }
-
 
 
 def extract_party_blocks(blocks, full_text):
