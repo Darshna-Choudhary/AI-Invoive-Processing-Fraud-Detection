@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import random
+import re
 import time
 from typing import Optional
 
@@ -11,22 +12,19 @@ from google import genai
 from google.genai import types
 
 from backend.config import BASE_DIR, GEMINI_MODEL, GEMINI_MAX_RETRIES
-from backend.extraction import validate_invoice
 
-load_dotenv(os.path.join(BASE_DIR, ".env"))
 
-API_KEY = os.getenv("GEMINI_API_KEY")
-if not API_KEY:
-    raise RuntimeError("GEMINI_API_KEY is missing from the project .env file")
+class DailyQuotaExceeded(Exception):
+    pass
+
 
 def create_gemini_clients():
-    """Create one sync/async client pair for a batch."""
-    if not API_KEY:
-        raise RuntimeError(
-            "GEMINI_API_KEY is missing from the project .env file"
-        )
-    sync_client = genai.Client(api_key=API_KEY)
-    return sync_client, sync_client.aio
+    load_dotenv(os.path.join(BASE_DIR, ".env"), override=False)
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY is missing from .env")
+    client = genai.Client(api_key=api_key)
+    return client, client.aio
 
 
 class Address(BaseModel):
@@ -68,7 +66,6 @@ class InvoiceExtraction(BaseModel):
     invoice_date: Optional[str] = None
     due_date: Optional[str] = None
     po_number: Optional[str] = None
-
     gstin: Optional[str] = None
     currency: Optional[str] = None
     subtotal: Optional[float] = None
@@ -80,35 +77,33 @@ class InvoiceExtraction(BaseModel):
     shipping: Optional[float] = None
     total_amount: Optional[float] = None
     payment_terms: Optional[str] = None
-
     supplier: Optional[Party] = None
     customer: Optional[Party] = None
     bank_details: Optional[BankDetails] = None
-
     line_items: list[LineItem] = Field(default_factory=list)
 
 
 SYSTEM_PROMPT = """
-You are a careful invoice data extraction system.
-
-Read the complete supplied invoice PDF or image. Invoice layouts and field
-labels vary. Use the document's visual layout and context, not fixed positions.
+You are a highly accurate invoice data extraction engine.
+Read the complete supplied invoice, every page and every visible line item.
+Use visual layout and column relationships, not fixed positions.
 
 Rules:
-- Extract only values supported by the document.
-- Never invent, infer, or repair a missing value. Use null.
-- Do not confuse invoice date with due date.
-- Do not confuse subtotal, tax, discount, amount paid, balance due and total.
-- Preserve monetary values as printed. Do not recalculate or silently correct them.
-- Extract all visible line items. Keep quantity, unit price, tax and line total
-  in their correct fields. Do not treat a unit price as a line total.
-- Identify supplier and customer separately. Do not swap their details.
-- Extract bank details only when explicitly printed.
-- If a field is ambiguous, return null rather than guessing.
-- Dates should be returned as printed, preferably YYYY-MM-DD only when the
-  date interpretation is unambiguous. If ambiguous, preserve the original text.
-- Currency should be an ISO code where identifiable (for example USD, INR, EUR).
-- Ignore unrelated text and marketing content.
+- Extract only information supported by the document. Never invent values.
+- Return null for missing or genuinely unreadable scalar fields.
+- Preserve invoice numbers exactly, including leading zeros and punctuation.
+- Do not confuse invoice date, due date, PO number or delivery date.
+- Distinguish subtotal, taxable value, discount, tax, shipping, amount paid,
+  balance due and final invoice total.
+- Preserve printed amounts. Never replace a printed amount with a calculation.
+- Extract every visible line item, preserving row-to-column relationships.
+- Do not confuse unit price with line total or merge separate line items.
+- Identify supplier/seller and customer/bill-to separately.
+- Extract tax IDs and bank details only when explicitly printed.
+- Use ISO currency codes when unambiguous.
+- Return YYYY-MM-DD dates only when interpretation is unambiguous; otherwise
+  preserve the original date text.
+- If uncertain, return null rather than guessing.
 """
 
 
@@ -121,167 +116,171 @@ def _to_dict(parsed):
         return parsed
     if isinstance(parsed, str):
         return json.loads(parsed)
-    raise TypeError(f"Unexpected parsed response type: {type(parsed)!r}")
+    raise TypeError(f"Unexpected response type: {type(parsed)!r}")
 
 
-def _build_validation(data):
-    validation = validate_invoice(data)
+def _validate(data):
+    subtotal = data.get("subtotal")
+    total = data.get("total_amount")
+    discount = data.get("discount") or 0
+    tax = data.get("tax_amount") or 0
+    shipping = data.get("shipping") or 0
+
+    if subtotal is None or total is None:
+        check = {"arithmetic_check": "not_verifiable",
+                 "calculated_total": None, "difference": None}
+    else:
+        calculated = round(float(subtotal) - float(discount) +
+                           float(tax) + float(shipping), 2)
+        difference = round(float(total) - calculated, 2)
+        check = {
+            "arithmetic_check": "passed" if abs(difference) <= 0.02 else "mismatch",
+            "calculated_total": calculated,
+            "difference": difference,
+        }
+
     issues = []
-
-    if validation["arithmetic_check"] == "mismatch":
+    if check["arithmetic_check"] == "mismatch":
         issues.append(
-            "Financial total mismatch: "
-            f"calculated={validation.get('calculated_total')}, "
-            f"printed={data.get('total_amount')}, "
-            f"difference={validation.get('difference')}"
+            f"Financial total mismatch: calculated={check['calculated_total']}, "
+            f"printed={total}, difference={check['difference']}"
         )
-    elif validation["arithmetic_check"] == "not_verifiable":
+    elif check["arithmetic_check"] == "not_verifiable":
         issues.append("Financial arithmetic could not be verified")
 
-    for key, label in (
-        ("invoice_number", "Invoice number"),
-        ("invoice_date", "Invoice date"),
-        ("total_amount", "Total amount"),
-    ):
-        if data.get(key) is None:
+    for key, label in (("invoice_number", "Invoice number"),
+                       ("invoice_date", "Invoice date"),
+                       ("total_amount", "Total amount")):
+        if data.get(key) in (None, ""):
             issues.append(f"{label} missing")
 
-    validation["issues"] = issues
-    data["validation"] = validation
+    data["validation"] = {**check, "issues": issues}
     return data
 
 
-async def _upload_file(path, sync_client):
-    # Files API upload is synchronous in the SDK. Move it off the event loop.
-    return await asyncio.to_thread(sync_client.files.upload, file=path)
+async def _upload(path, client):
+    return await asyncio.to_thread(client.files.upload, file=path)
 
 
-async def _delete_remote_file(file_name, sync_client):
-    if not file_name:
+async def _delete_remote(name, client):
+    if not name:
         return
     try:
-        await asyncio.to_thread(
-            sync_client.files.delete,
-            name=file_name
-        )
+        await asyncio.to_thread(client.files.delete, name=name)
     except Exception:
-        # Gemini Files are temporary (normally retained for up to 48 hours).
-        # A cleanup failure should not turn a successful extraction into failure.
         pass
 
 
+def _daily_quota(exc):
+    message = str(exc).lower()
+    return ("per day" in message or "perday" in message or
+            "requestsperday" in message or
+            ("generate_content_free_tier_requests" in message and "day" in message))
+
+
+def _retryable(exc):
+    message = str(exc).lower()
+    code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    return code in (408, 429, 500, 502, 503, 504) or any(
+        word in message for word in (
+            "429", "503", "temporarily unavailable", "resource exhausted",
+            "timeout", "rate limit", "internal server error"
+        )
+    )
+
+
+def _retry_delay(exc, attempt):
+    message = str(exc)
+    for pattern in (
+        r"retry in\s+([0-9]+(?:\.[0-9]+)?)\s*s",
+        r'"retryDelay"\s*:\s*"([0-9]+(?:\.[0-9]+)?)s"',
+        r"retrydelay.*?([0-9]+(?:\.[0-9]+)?)s",
+    ):
+        match = re.search(pattern, message, re.IGNORECASE)
+        if match:
+            return min(180.0, max(1.0, float(match.group(1)) + 1.0))
+    return min(60.0, 2 ** attempt) + random.uniform(0.2, 0.8)
+
+
 async def extract_invoice_with_gemini(
-    file_info, semaphore, sync_client, async_client
+    file_info, semaphore, client, async_client, request_pacer, quota_stop_event
 ):
-    path = file_info["path"]
-    uploaded = None
     started = time.perf_counter()
+    uploaded = None
+    path = file_info["path"]
+
+    def make_result(status, data=None, error=None, stage="completed"):
+        return {
+            "invoice_id": file_info["invoice_id"],
+            "filename": os.path.basename(path),
+            "source_hash": file_info["source_hash"],
+            "status": status,
+            "raw_text": "",
+            "data": data or {},
+            "error": error,
+            "stage": stage,
+            "processing_time": round(time.perf_counter() - started, 2),
+        }
 
     async with semaphore:
-        try:
-            uploaded = await _upload_file(path, sync_client)
+        if quota_stop_event.is_set():
+            return make_result("pending", error="Daily Gemini quota exhausted; retry later.",
+                               stage="quota")
 
-            last_error = None
+        try:
+            uploaded = await _upload(path, client)
+
             for attempt in range(GEMINI_MAX_RETRIES + 1):
+                if quota_stop_event.is_set():
+                    return make_result("pending", error="Daily Gemini quota exhausted; retry later.",
+                                       stage="quota")
                 try:
+                    await request_pacer.wait()
                     response = await async_client.models.generate_content(
                         model=GEMINI_MODEL,
-                        contents=[
-                            SYSTEM_PROMPT,
-                            "Extract this invoice into the requested schema.",
-                            uploaded,
-                        ],
+                        contents=[SYSTEM_PROMPT,
+                                  "Extract this invoice into the requested schema.",
+                                  uploaded],
                         config=types.GenerateContentConfig(
                             response_mime_type="application/json",
                             response_schema=InvoiceExtraction,
                             temperature=0,
                         ),
                     )
-
                     parsed = getattr(response, "parsed", None)
-                    if parsed is None and response.text:
+                    if parsed is None and getattr(response, "text", None):
                         parsed = json.loads(response.text)
-
                     data = _to_dict(parsed)
-
-                    # Normalize nested objects and preserve the keys expected
-                    # by the existing Google Sheets and Excel modules.
                     data["supplier"] = data.get("supplier") or {}
                     data["customer"] = data.get("customer") or {}
                     data["bank_details"] = data.get("bank_details") or {}
                     data["line_items"] = data.get("line_items") or []
-
-                    if not data.get("vendor"):
-                        data["vendor"] = (
-                            data["supplier"].get("name")
-                            if isinstance(data["supplier"], dict)
-                            else None
-                        )
-
-                    if not data.get("bill_to"):
-                        customer = data["customer"]
-                        data["bill_to"] = (
-                            customer.get("name")
-                            if isinstance(customer, dict)
-                            else None
-                        )
-
-                    data = _build_validation(data)
-
-                    return {
-                        "invoice_id": file_info["invoice_id"],
-                        "filename": os.path.basename(path),
-                        "status": "success",
-                        "raw_text": "",
-                        "data": data,
-                        "error": None,
-                        "stage": "completed",
-                        "processing_time": round(time.perf_counter() - started, 2),
-                    }
+                    if not data.get("vendor") and isinstance(data["supplier"], dict):
+                        data["vendor"] = data["supplier"].get("name")
+                    if not data.get("bill_to") and isinstance(data["customer"], dict):
+                        data["bill_to"] = data["customer"].get("name")
+                    return make_result("success", data=_validate(data))
 
                 except Exception as exc:
-                    last_error = exc
-                    code = getattr(exc, "code", None)
-
-                    # Retry transient throttling/server errors only.
-                    retryable = (
-                        code in (408, 429, 500, 502, 503, 504)
-                        or any(s in str(exc).lower() for s in (
-                            "429", "503", "temporarily unavailable",
-                            "resource exhausted", "timeout"
-                        ))
-                    )
-                    if not retryable or attempt >= GEMINI_MAX_RETRIES:
+                    if _daily_quota(exc):
+                        quota_stop_event.set()
+                        return make_result("pending", error=str(exc), stage="quota")
+                    if not _retryable(exc) or attempt >= GEMINI_MAX_RETRIES:
                         raise
+                    await asyncio.sleep(_retry_delay(exc, attempt))
 
-                    await asyncio.sleep(
-                        min(2 ** attempt, 12) + random.uniform(0, 0.5)
-                    )
-
-            raise last_error
+            return make_result("failed", error="Gemini retries exhausted.",
+                               stage="gemini_extraction")
 
         except Exception as exc:
-            return {
-                "invoice_id": file_info["invoice_id"],
-                "filename": os.path.basename(path),
-                "status": "failed",
-                "raw_text": "",
-                "data": {},
-                "error": str(exc),
-                "stage": "gemini_extraction",
-                "processing_time": round(time.perf_counter() - started, 2),
-            }
-
+            return make_result("failed", error=str(exc), stage="gemini_extraction")
         finally:
             if uploaded is not None:
-                await _delete_remote_file(
-                    getattr(uploaded, "name", None),
-                    sync_client
-                )
+                await _delete_remote(getattr(uploaded, "name", None), client)
 
 
-async def close_gemini_clients(sync_client, async_client):
+async def close_gemini_clients(client, async_client):
     try:
         await async_client.aclose()
     finally:
-        sync_client.close()
+        client.close()
