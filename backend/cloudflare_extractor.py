@@ -16,9 +16,9 @@ from backend.config import (
     CLOUDFLARE_TIMEOUT, CLOUDFLARE_MAX_RETRIES, CLOUDFLARE_MAX_INPUT_CHARS,
 )
 
-CHAT_URL = (
+RUN_URL = (
     "https://api.cloudflare.com/client/v4/accounts/"
-    f"{CLOUDFLARE_ACCOUNT_ID}/ai/v1/chat/completions"
+    f"{CLOUDFLARE_ACCOUNT_ID}/ai/run/{CLOUDFLARE_MODEL}"
 )
 
 # Keep the response contract aligned with the fields consumed by sheet_sync.py.
@@ -106,39 +106,36 @@ def _require_credentials():
 
 
 def _extract_content(payload: dict) -> str:
+    """Extract final assistant text from a normalized Workers AI response."""
     choices = payload.get("choices") or []
-
     if not choices:
         raise ValueError(
-            f"No choices returned: {str(payload)[:1000]}"
+            f"Cloudflare returned no choices. Response keys: {list(payload.keys())}; "
+            f"response preview: {str(payload)[:1200]}"
         )
 
-    choice = choices[0]
+    choice = choices[0] or {}
     message = choice.get("message") or {}
-
     content = message.get("content")
 
     if isinstance(content, list):
         content = "".join(
-            part.get("text", "")
-            for part in content
-            if isinstance(part, dict)
+            part.get("text", "") for part in content if isinstance(part, dict)
         )
 
     if not isinstance(content, str) or not content.strip():
         raise ValueError(
-            "Empty model content. "
-            f"Finish reason: {choice.get('finish_reason')}; "
-            f"Message keys: {list(message.keys())}; "
-            f"Reasoning present: {bool(message.get('reasoning'))}; "
-            f"Usage: {payload.get('usage')}"
+            "Cloudflare returned empty final content. "
+            f"finish_reason={choice.get('finish_reason')!r}; "
+            f"reasoning_present={bool(message.get('reasoning'))}; "
+            f"message_keys={list(message.keys())}"
         )
-
     return content.strip()
 
 
 def _parse_json(content: str) -> dict:
-    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", content.strip(), flags=re.I)
+    cleaned = re.sub(r"^```(?:json)?\s*", "", content.strip(), flags=re.I)
+    cleaned = re.sub(r"\s*```$", "", cleaned.strip())
     data = json.loads(cleaned)
     if not isinstance(data, dict):
         raise ValueError("Model response must be a JSON object")
@@ -223,31 +220,49 @@ def normalize_and_validate(data: dict) -> dict:
 
 
 def _post_chat(prompt: str) -> dict:
+    """Call the tested Workers AI /ai/run endpoint and normalize its envelope.
+
+    The direct /ai/run endpoint returns {"result": {"choices": [...]}}.
+    This function unwraps result so the rest of this module always receives
+    the choices object at the top level.
+    """
     _require_credentials()
     body = {
-        "model": CLOUDFLARE_MODEL,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": SYSTEM_PROMPT + "\nReturn only the JSON object. Do not include Markdown fences or reasoning."},
             {"role": "user", "content": prompt},
         ],
         "temperature": 0,
         "max_tokens": 4096,
-        "stream": False,
-        "response_format": {"type": "json_object"},
-
-        "chat_template_kwargs": {"enable_thinking": False}
+        "chat_template_kwargs": {
+            "enable_thinking": False,
+            "clear_thinking": True,
+        },
     }
     request = urllib.request.Request(
-        CHAT_URL,
-        data=json.dumps(body).encode("utf-8"),
-        headers={"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}", "Content-Type": "application/json"},
+        RUN_URL,
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}",
+            "Content-Type": "application/json",
+        },
         method="POST",
     )
+    started = time.perf_counter()
     try:
         with urllib.request.urlopen(request, timeout=CLOUDFLARE_TIMEOUT) as response:
-            result = json.loads(response.read().decode("utf-8"))
-            if isinstance(result, dict) and result.get("success") is False:
-                raise RuntimeError(f"Cloudflare API error: {result.get('errors')}")
+            raw = response.read().decode("utf-8")
+            envelope = json.loads(raw)
+            elapsed = time.perf_counter() - started
+            print(f"[Cloudflare] HTTP {response.status} in {elapsed:.2f}s; model={CLOUDFLARE_MODEL}")
+
+            if not isinstance(envelope, dict) or envelope.get("success") is False:
+                raise RuntimeError(f"Cloudflare API error: {str(envelope.get('errors'))[:1500] if isinstance(envelope, dict) else raw[:1500]}")
+
+            # Direct /ai/run wraps the chat completion in the 'result' key.
+            result = envelope.get("result", envelope)
+            if not isinstance(result, dict):
+                raise ValueError(f"Unexpected Cloudflare result type: {type(result).__name__}")
             return result
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")[:2000]
@@ -286,14 +301,7 @@ def extract_invoice_from_ocr(raw_text: str) -> dict:
     last_error = None
     for attempt in range(CLOUDFLARE_MAX_RETRIES + 1):
         try:
-            start = time.perf_counter()
-            print("Cloudflare request started")
-            
             response = _post_chat(prompt)
-            
-            elapsed = time.perf_counter() - start
-            print(f"Cloudflare response received: {elapsed:.2f}s")
-            
             content = _extract_content(response)
             return normalize_and_validate(_parse_json(content))
         except Exception as exc:

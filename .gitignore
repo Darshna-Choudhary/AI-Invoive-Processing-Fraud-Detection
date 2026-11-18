@@ -1,19 +1,32 @@
-__pycache__/
-*.pyc
-*.pyo
-.env
+# Virtual environments
 .venv/
 venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+credentials/
+
+# Local data and uploaded invoices
+data/
+uploads/
+
+# Keep empty upload/output folders if needed
+!/uploads/.gitkeep
+!/outputs/.gitkeep
+
+# Logs and temporary files
+*.log
 .ipynb_checkpoints/
 .DS_Store
-*.log
-data/
-/uploads/*
-!/uploads/.gitkeep
-/outputs/*
-!/outputs/.gitkeep
-credentials/
-outputs/
-uploads/
-excel_export.py
-__init__.py
+
+# Local Python version file
+.python-version
+
+test_cloudflare.py
