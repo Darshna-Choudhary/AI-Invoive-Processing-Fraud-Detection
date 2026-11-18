@@ -1,40 +1,27 @@
+"""End-to-end batch pipeline: local PaddleOCR -> Cloudflare JSON -> Sheets."""
 import asyncio
 import hashlib
+import multiprocessing
 import os
 import time
 import uuid
 import threading
+from concurrent.futures import ProcessPoolExecutor
 
 from backend.config import (
-    ALLOWED_EXTENSIONS, GEMINI_CONCURRENCY, GEMINI_RPM_LIMIT,
-    GEMINI_RPM_SAFETY_FACTOR,
+    ALLOWED_EXTENSIONS, OCR_WORKERS, CLOUDFLARE_CONCURRENCY, CLOUDFLARE_RPM_LIMIT,
 )
-from backend.gemini_extractor import (
-    create_gemini_clients, extract_invoice_with_gemini, close_gemini_clients,
+from backend.ocr_worker import initialize_worker, process_single_invoice
+from backend.cloudflare_extractor import (
+    CloudflareQuotaOrCapacityError, extract_invoice_async,
 )
-from backend.sheet_sync import sync_batch_to_google_sheets
-
-
-class ProcessSemaphore:
-    """A process-wide concurrency cap shared across batches and event loops."""
-    def __init__(self, limit):
-        self._semaphore = threading.BoundedSemaphore(limit)
-
-    async def __aenter__(self):
-        await asyncio.to_thread(self._semaphore.acquire)
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb):
-        self._semaphore.release()
+from backend.sheet_sync import sync_batch_to_google_sheets, get_existing_invoice_index
 
 
 class RequestPacer:
-    """Process-local limiter for Gemini generate_content request starts."""
-    def __init__(self, rpm_limit, safety_factor):
-        effective_rpm = max(0.1, rpm_limit * safety_factor)
-        self.interval = 60.0 / effective_rpm
-        # threading.Lock makes this limiter shared across concurrent batches
-        # and across the separate event loops created by Streamlit's asyncio.run.
+    """Process-wide request-start limiter shared across batches/event loops."""
+    def __init__(self, rpm_limit):
+        self.interval = 60.0 / max(1, rpm_limit)
         self.lock = threading.Lock()
         self.next_start = 0.0
 
@@ -48,11 +35,7 @@ class RequestPacer:
             await asyncio.sleep(delay)
 
 
-# One limiter per Python process, shared by all batches in that process.
-_GLOBAL_REQUEST_PACER = RequestPacer(
-    GEMINI_RPM_LIMIT, GEMINI_RPM_SAFETY_FACTOR
-)
-_GLOBAL_CONCURRENCY_SEMAPHORE = ProcessSemaphore(GEMINI_CONCURRENCY)
+_GLOBAL_REQUEST_PACER = RequestPacer(CLOUDFLARE_RPM_LIMIT)
 
 
 def calculate_file_hash(path):
@@ -81,6 +64,83 @@ def create_file_manifest(paths):
     return manifest
 
 
+def _result_from_ocr_failure(ocr_result, started):
+    return {
+        **ocr_result,
+        "processing_time": round(time.perf_counter() - started, 2),
+    }
+
+
+async def _process_one(item, ocr_pool, llm_semaphore, quota_stop):
+    started = time.perf_counter()
+    loop = asyncio.get_running_loop()
+    try:
+        # PaddleOCR runs in a persistent local worker process, not in the UI thread.
+        ocr_result = await loop.run_in_executor(ocr_pool, process_single_invoice, item)
+        if ocr_result.get("status") != "ocr_success":
+            return _result_from_ocr_failure(ocr_result, started)
+
+        if quota_stop.is_set():
+            return {
+                **ocr_result,
+                "status": "pending",
+                "data": {},
+                "error": "Cloudflare rate/quota limit reached; retry this invoice later.",
+                "stage": "cloudflare_quota",
+                "processing_time": round(time.perf_counter() - started, 2),
+            }
+
+        await _GLOBAL_REQUEST_PACER.wait()
+        if quota_stop.is_set():
+            return {
+                **ocr_result, "status": "pending", "data": {},
+                "error": "Cloudflare rate/quota limit reached; retry this invoice later.",
+                "stage": "cloudflare_quota",
+                "processing_time": round(time.perf_counter() - started, 2),
+            }
+        try:
+            data = await extract_invoice_async(ocr_result["raw_text"], llm_semaphore)
+            return {
+                **ocr_result,
+                "status": "success",
+                "data": data,
+                "error": None,
+                "stage": "completed",
+                "processing_time": round(time.perf_counter() - started, 2),
+            }
+        except CloudflareQuotaOrCapacityError as exc:
+            quota_stop.set()
+            return {
+                **ocr_result,
+                "status": "pending",
+                "data": {},
+                "error": str(exc),
+                "stage": "cloudflare_quota",
+                "processing_time": round(time.perf_counter() - started, 2),
+            }
+        except Exception as exc:
+            return {
+                **ocr_result,
+                "status": "failed",
+                "data": {},
+                "error": str(exc),
+                "stage": "cloudflare_extraction",
+                "processing_time": round(time.perf_counter() - started, 2),
+            }
+    except Exception as exc:
+        return {
+            "invoice_id": item["invoice_id"],
+            "filename": os.path.basename(item["path"]),
+            "source_hash": item["source_hash"],
+            "status": "failed",
+            "raw_text": "",
+            "data": {},
+            "error": str(exc),
+            "stage": "pipeline",
+            "processing_time": round(time.perf_counter() - started, 2),
+        }
+
+
 async def process_batch(file_paths, progress_callback=None):
     batch_id = str(uuid.uuid4())
     manifest = create_file_manifest(file_paths)
@@ -88,74 +148,103 @@ async def process_batch(file_paths, progress_callback=None):
         raise ValueError("No supported or unique invoice files found.")
 
     started = time.perf_counter()
-    semaphore = _GLOBAL_CONCURRENCY_SEMAPHORE
-    pacer = _GLOBAL_REQUEST_PACER
     quota_stop = asyncio.Event()
-    client, async_client = create_gemini_clients()
+    llm_semaphore = asyncio.Semaphore(CLOUDFLARE_CONCURRENCY)
     tasks = []
+    results = []
+    processed_results = []
 
+    # Preflight duplicate check: don't spend OCR/LLM time on files already completed.
+    # If Sheets is temporarily unavailable, fall back to normal processing and let sync report the error.
     try:
-        tasks = [
-            asyncio.create_task(
-                extract_invoice_with_gemini(
-                    item, semaphore, client, async_client, pacer, quota_stop
-                )
-            )
-            for item in manifest
-        ]
-        results = []
-        for task in asyncio.as_completed(tasks):
-            result = await task
-            results.append(result)
+        existing_by_hash = await asyncio.to_thread(get_existing_invoice_index)
+    except Exception:
+        existing_by_hash = None
+
+    process_manifest = []
+    for item in manifest:
+        existing = existing_by_hash.get(item["source_hash"]) if existing_by_hash is not None else None
+        if existing and existing[1] not in ("failed", "pending"):
+            skipped_result = {
+                "invoice_id": item["invoice_id"],
+                "filename": os.path.basename(item["path"]),
+                "source_hash": item["source_hash"],
+                "status": "duplicate_skipped",
+                "raw_text": "",
+                "data": {},
+                "error": None,
+                "stage": "duplicate_check",
+                "processing_time": 0.0,
+            }
+            results.append(skipped_result)
             if progress_callback:
                 try:
-                    progress_callback(result, len(results), len(manifest))
+                    progress_callback(skipped_result, len(results), len(manifest))
                 except Exception:
                     pass
+        else:
+            process_manifest.append(item)
 
-        sync_error = None
-        try:
-            sync_report = await asyncio.to_thread(
-                sync_batch_to_google_sheets, results, batch_id
-            )
-        except Exception as exc:
-            # Keep extraction results visible even if the Sheets API is unavailable.
-            sync_error = str(exc)
-            sync_report = {
-                "spreadsheet_url": None,
-                "inserted": 0,
-                "updated": 0,
-                "duplicates_skipped": 0,
-                "line_items_inserted": 0,
-                "review_inserted": 0,
-            }
-
-        return {
-            "batch_id": batch_id,
-            "total": len(manifest),
-            "completed": len(results),
-            "success": sum(r["status"] == "success" for r in results),
-            "review": sum(
-                r["status"] == "success" and
-                bool((r.get("data") or {}).get("validation", {}).get("issues"))
-                for r in results
-            ),
-            "failed": sum(r["status"] == "failed" for r in results),
-            "pending": sum(r["status"] == "pending" for r in results),
-            "processing_time": round(time.perf_counter() - started, 2),
-            "google_sheet_url": sync_report.get("spreadsheet_url"),
-            "sync_error": sync_error,
-            "results": results,
-            "inserted": sync_report.get("inserted", 0),
-            "updated": sync_report.get("updated", 0),
-            "duplicates_skipped": sync_report.get("duplicates_skipped", 0),
-            "line_items_inserted": sync_report.get("line_items_inserted", 0),
-            "review_inserted": sync_report.get("review_inserted", 0),
-        }
+    # Spawn avoids inheriting initialized native OCR/Paddle state from Streamlit.
+    ocr_pool = None
+    if process_manifest:
+        ocr_pool = ProcessPoolExecutor(
+            max_workers=OCR_WORKERS,
+            mp_context=multiprocessing.get_context("spawn"),
+            initializer=initialize_worker,
+        )
+    try:
+        if process_manifest:
+            tasks = [asyncio.create_task(_process_one(item, ocr_pool, llm_semaphore, quota_stop)) for item in process_manifest]
+            for task in asyncio.as_completed(tasks):
+                result = await task
+                results.append(result)
+                processed_results.append(result)
+                if progress_callback:
+                    try:
+                        progress_callback(result, len(results), len(manifest))
+                    except Exception:
+                        pass
     finally:
         for task in tasks:
             if not task.done():
                 task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-        await close_gemini_clients(client, async_client)
+        if ocr_pool is not None:
+            ocr_pool.shutdown(wait=True, cancel_futures=True)
+
+    sync_error = None
+    try:
+        sync_report = await asyncio.to_thread(
+            sync_batch_to_google_sheets, processed_results, batch_id, existing_by_hash
+        )
+    except Exception as exc:
+        sync_error = str(exc)
+        sync_report = {
+            "spreadsheet_url": None, "inserted": 0, "updated": 0,
+            "duplicates_skipped": 0, "line_items_inserted": 0, "review_inserted": 0,
+        }
+
+    pre_skipped = sum(1 for r in results if r["status"] == "duplicate_skipped")
+    return {
+        "batch_id": batch_id,
+        "total": len(manifest),
+        "completed": len(results),
+        "success": sum(r["status"] == "success" for r in results),
+        "review": sum(
+            r["status"] == "success" and bool((r.get("data") or {}).get("validation", {}).get("issues"))
+            for r in results
+        ),
+        "failed": sum(r["status"] == "failed" for r in results),
+        "pending": sum(r["status"] == "pending" for r in results),
+        "processing_time": round(time.perf_counter() - started, 2),
+        "google_sheet_url": sync_report.get("spreadsheet_url"),
+        "sync_error": sync_error,
+        "results": results,
+        "inserted": sync_report.get("inserted", 0),
+        "updated": sync_report.get("updated", 0),
+        "duplicates_skipped": pre_skipped + sync_report.get("duplicates_skipped", 0),
+        "line_items_inserted": sync_report.get("line_items_inserted", 0),
+        "review_inserted": sync_report.get("review_inserted", 0),
+    }

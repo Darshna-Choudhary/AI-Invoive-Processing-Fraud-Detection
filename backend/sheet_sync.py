@@ -210,18 +210,32 @@ def _build_rows(result, batch_id):
     return status, invoice_row, line_rows, review_rows
 
 
-def sync_batch_to_google_sheets(results, batch_id):
+def get_existing_invoice_index():
+    """Read existing source hashes once so completed duplicates can be skipped before OCR."""
     spreadsheet = get_spreadsheet()
     invoice_ws = get_or_create_tab(spreadsheet, "Invoices", HEADERS["Invoices"])
-    items_ws = get_or_create_tab(spreadsheet, "Line Items", HEADERS["Line Items"])
-    review_ws = get_or_create_tab(spreadsheet, "Needs Review", HEADERS["Needs Review"])
-
     existing_values = invoice_ws.get_all_values()
     existing_by_hash = {}
     for row_number, row in enumerate(existing_values[1:], start=2):
         if row and row[0]:
             old_status = row[4].strip().lower() if len(row) > 4 else ""
             existing_by_hash[row[0].strip()] = (row_number, old_status)
+    return existing_by_hash
+
+
+def sync_batch_to_google_sheets(results, batch_id, existing_by_hash=None):
+    spreadsheet = get_spreadsheet()
+    invoice_ws = get_or_create_tab(spreadsheet, "Invoices", HEADERS["Invoices"])
+    items_ws = get_or_create_tab(spreadsheet, "Line Items", HEADERS["Line Items"])
+    review_ws = get_or_create_tab(spreadsheet, "Needs Review", HEADERS["Needs Review"])
+
+    if existing_by_hash is None:
+        existing_values = invoice_ws.get_all_values()
+        existing_by_hash = {}
+        for row_number, row in enumerate(existing_values[1:], start=2):
+            if row and row[0]:
+                old_status = row[4].strip().lower() if len(row) > 4 else ""
+                existing_by_hash[row[0].strip()] = (row_number, old_status)
 
     # If the same file is accidentally included twice in this batch, use one
     # result. Prefer successful extraction over pending/failed.

@@ -23,7 +23,7 @@ from backend.batch_processor import process_batch
 
 st.set_page_config(page_title="Invoice Batch Processor", page_icon="📄", layout="wide")
 st.title("📄 AI Invoice Processing System")
-st.caption("Bulk invoice extraction with Gemini Vision and Google Sheets integration")
+st.caption("Local PaddleOCR + Cloudflare Workers AI extraction with Google Sheets integration")
 
 DEFAULTS = {
     "running": False, "event_queue": None, "result": None,
@@ -221,7 +221,7 @@ def processing_dashboard():
         if retry_paths:
             if pending:
                 st.warning(
-                    "Pending invoices may be waiting for the Gemini daily quota reset. "
+                    "Pending invoices may be waiting for Cloudflare rate limits or daily quota to reset. "
                     "Retry after quota is available."
                 )
             if st.button(
