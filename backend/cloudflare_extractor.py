@@ -102,7 +102,10 @@ class CloudflareQuotaOrCapacityError(Exception):
 
 def _require_credentials():
     if not CLOUDFLARE_ACCOUNT_ID or not CLOUDFLARE_API_TOKEN:
-        raise RuntimeError("CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN must be set in .env")
+        raise RuntimeError(
+            "CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN must be set in "
+            "Streamlit Secrets or environment variables"
+        )
 
 
 def _extract_content(payload: dict) -> str:

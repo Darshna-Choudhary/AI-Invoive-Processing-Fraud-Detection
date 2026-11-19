@@ -7,13 +7,15 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 
+from backend.config import get_secret
+
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-SPREADSHEET_ID = os.getenv("GOOGLE_SHEET_ID")
-CLIENT_FILE = os.getenv("GOOGLE_OAUTH_CLIENT_FILE", "credentials/client_secret.json")
-TOKEN_FILE = os.getenv("GOOGLE_TOKEN_FILE", "credentials/token.json")
+SPREADSHEET_ID = get_secret("GOOGLE_SHEET_ID") or None
+CLIENT_FILE = get_secret("GOOGLE_OAUTH_CLIENT_FILE", "credentials/client_secret.json")
+TOKEN_FILE = get_secret("GOOGLE_TOKEN_FILE", "credentials/token.json")
 
 HEADERS = {
     "Invoices": [

@@ -4,6 +4,38 @@ from dotenv import load_dotenv
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
+
+def get_secret(name, default=""):
+    """Read an environment variable or a Streamlit secret (flat or nested)."""
+    value = os.getenv(name)
+    if value is not None:
+        return value
+
+    try:
+        import streamlit as st
+        secrets = st.secrets
+    except Exception:
+        return default
+
+    try:
+        value = secrets.get(name)
+        if value is not None:
+            return str(value)
+    except Exception:
+        pass
+
+    for section_name in ("cloudflare", "google"):
+        try:
+            section = secrets.get(section_name)
+            if section is not None:
+                value = section.get(name)
+                if value is not None:
+                    return str(value)
+        except Exception:
+            pass
+
+    return default
+
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
@@ -20,13 +52,13 @@ OCR_WORKERS = max(1, int(os.getenv("OCR_WORKERS", "1")))
 OCR_CPU_THREADS = max(1, int(os.getenv("OCR_CPU_THREADS", "2")))
 
 # Cloudflare Workers AI REST API settings.
-CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
-CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
-CLOUDFLARE_MODEL = os.getenv(
+CLOUDFLARE_ACCOUNT_ID = get_secret("CLOUDFLARE_ACCOUNT_ID").strip()
+CLOUDFLARE_API_TOKEN = get_secret("CLOUDFLARE_API_TOKEN").strip()
+CLOUDFLARE_MODEL = get_secret(
     "CLOUDFLARE_MODEL", "@cf/google/gemma-4-26b-a4b-it"
 ).strip()
-CLOUDFLARE_CONCURRENCY = max(1, int(os.getenv("CLOUDFLARE_CONCURRENCY", "1")))
-CLOUDFLARE_RPM_LIMIT = max(1, int(os.getenv("CLOUDFLARE_RPM_LIMIT", "5")))
-CLOUDFLARE_MAX_RETRIES = max(0, int(os.getenv("CLOUDFLARE_MAX_RETRIES", "0")))
-CLOUDFLARE_TIMEOUT = max(10, int(os.getenv("CLOUDFLARE_TIMEOUT", "60")))
-CLOUDFLARE_MAX_INPUT_CHARS = max(10000, int(os.getenv("CLOUDFLARE_MAX_INPUT_CHARS", "100000")))
+CLOUDFLARE_CONCURRENCY = max(1, int(get_secret("CLOUDFLARE_CONCURRENCY", "1") or "1"))
+CLOUDFLARE_RPM_LIMIT = max(1, int(get_secret("CLOUDFLARE_RPM_LIMIT", "5") or "5"))
+CLOUDFLARE_MAX_RETRIES = max(0, int(get_secret("CLOUDFLARE_MAX_RETRIES", "0") or "0"))
+CLOUDFLARE_TIMEOUT = max(10, int(get_secret("CLOUDFLARE_TIMEOUT", "60") or "60"))
+CLOUDFLARE_MAX_INPUT_CHARS = max(10000, int(get_secret("CLOUDFLARE_MAX_INPUT_CHARS", "100000") or "100000"))
