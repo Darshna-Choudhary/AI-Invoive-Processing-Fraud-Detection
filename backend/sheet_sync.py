@@ -1,6 +1,7 @@
 import os
 from datetime import datetime, date
-
+import json
+import streamlit as st
 import gspread
 from dotenv import load_dotenv
 from google.auth.transport.requests import Request
@@ -43,24 +44,58 @@ def _absolute(path):
     return path if os.path.isabs(path) else os.path.join(BASE_DIR, path)
 
 
+
 def get_google_credentials():
+    # Deployed Streamlit authentication
+    if "GOOGLE_TOKEN" in st.secrets:
+        token_info = json.loads(st.secrets["GOOGLE_TOKEN"])
+
+        creds = Credentials.from_authorized_user_info(
+            token_info, SCOPES
+        )
+
+        if creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+
+        if not creds.valid:
+            raise ValueError(
+                "Google OAuth token invalid. Check refresh_token."
+            )
+
+        return creds
+
+    # Local authentication (existing workflow)
     client_path = _absolute(CLIENT_FILE)
     token_path = _absolute(TOKEN_FILE)
+
     if not os.path.exists(client_path):
-        raise FileNotFoundError(f"Google OAuth client JSON not found: {client_path}")
+        raise FileNotFoundError(
+            f"Google OAuth client JSON not found: {client_path}"
+        )
 
     creds = None
+
     if os.path.exists(token_path):
-        creds = Credentials.from_authorized_user_file(token_path, SCOPES)
+        creds = Credentials.from_authorized_user_file(
+            token_path, SCOPES
+        )
+
     if creds and creds.expired and creds.refresh_token:
         creds.refresh(Request())
+
     if not creds or not creds.valid:
-        flow = InstalledAppFlow.from_client_secrets_file(client_path, SCOPES)
-        creds = flow.run_local_server(port=0, prompt="consent")
+        flow = InstalledAppFlow.from_client_secrets_file(
+            client_path, SCOPES
+        )
+        creds = flow.run_local_server(
+            port=0, prompt="consent"
+        )
 
     os.makedirs(os.path.dirname(token_path), exist_ok=True)
+
     with open(token_path, "w", encoding="utf-8") as token:
         token.write(creds.to_json())
+
     return creds
 
 
