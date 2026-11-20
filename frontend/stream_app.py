@@ -201,7 +201,7 @@ def processing_dashboard():
         if report.get("google_sheet_url"):
             st.link_button("📊 Open Google Sheets", report["google_sheet_url"])
         else:
-            st.warning("No Google Sheets URL was returned. Check the backend logs.")
+            st.error(f"Google Sheets Sync Error: {report.get('sync_error')}")
 
         a, b, c = st.columns(3)
         a.metric("New invoice rows", report.get("inserted", 0))
